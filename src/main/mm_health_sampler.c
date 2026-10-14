@@ -84,10 +84,13 @@ typedef int mm_socket;
 #define MM_BAD_SOCKET (-1)
 #endif
 
+#define MM_LINKSTATE_MAX_PORTS 4
+
 static mm_socket l_socket = MM_BAD_SOCKET;
 static int l_socket_failed;
 static int l_send_error_logged;
-static struct sockaddr_in l_destination;
+static struct sockaddr_in l_destinations[MM_LINKSTATE_MAX_PORTS];
+static int l_destination_count;
 static uint32_t l_sequence;
 
 static void read_state(mm_state* s)
@@ -123,21 +126,55 @@ static void put_u32(uint8_t* p, uint32_t v)
     put_u16(p + 2, (uint16_t) (v >> 16));
 }
 
+static void add_destination(long port)
+{
+    struct sockaddr_in* d;
+
+    if (port <= 0 || port >= 65536 || l_destination_count >= MM_LINKSTATE_MAX_PORTS)
+        return;
+    d = &l_destinations[l_destination_count++];
+    memset(d, 0, sizeof(*d));
+    d->sin_family = AF_INET;
+    d->sin_port = htons((unsigned short) port);
+    d->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    DebugMessage(M64MSG_INFO, "[MMLinkState] exporting LinkState v%d to 127.0.0.1:%ld",
+                 MM_LINKSTATE_VERSION, port);
+}
+
+/* Destinations: MM_LINKSTATE_PORTS (comma-separated, up to 4), else
+ * MM_LINKSTATE_PORT, else the default port. Invalid entries are skipped. */
+static void configure_destinations(void)
+{
+    const char* list = getenv("MM_LINKSTATE_PORTS");
+    const char* single = getenv("MM_LINKSTATE_PORT");
+
+    l_destination_count = 0;
+    if (list != NULL)
+    {
+        const char* p = list;
+        while (*p != '\0')
+        {
+            char* end;
+            long port = strtol(p, &end, 10);
+            if (end != p)
+                add_destination(port);
+            p = (*end == ',') ? end + 1 : (end != p ? end : p + 1);
+        }
+    }
+    if (l_destination_count == 0 && single != NULL)
+        add_destination(atol(single));
+    if (l_destination_count == 0)
+        add_destination(MM_LINKSTATE_DEFAULT_PORT);
+}
+
 /* Opens a non-blocking socket on first use. On failure it logs once and
  * stops trying, so the emulation thread never stalls on networking. */
 static int open_socket(void)
 {
-    const char* port_text;
-    long port = MM_LINKSTATE_DEFAULT_PORT;
-
     if (l_socket != MM_BAD_SOCKET)
         return 1;
     if (l_socket_failed)
         return 0;
-
-    port_text = getenv("MM_LINKSTATE_PORT");
-    if (port_text != NULL && atol(port_text) > 0 && atol(port_text) < 65536)
-        port = atol(port_text);
 
 #ifdef _WIN32
     {
@@ -170,12 +207,7 @@ static int open_socket(void)
         return 0;
     }
 
-    memset(&l_destination, 0, sizeof(l_destination));
-    l_destination.sin_family = AF_INET;
-    l_destination.sin_port = htons((unsigned short) port);
-    l_destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    DebugMessage(M64MSG_INFO, "[MMLinkState] exporting LinkState v%d to 127.0.0.1:%ld",
-                 MM_LINKSTATE_VERSION, port);
+    configure_destinations();
     return 1;
 }
 
@@ -187,6 +219,7 @@ static void send_state(unsigned int frame_index, const mm_state* s, uint32_t fla
     uint8_t packet[MM_LINKSTATE_SIZE];
     uint32_t fields = MM_FIELD_HEALTH | MM_FIELD_HEALTH_CAPACITY | MM_FIELD_MAGIC |
                       MM_FIELD_MAGIC_LEVEL | MM_FIELD_SAVED_FORM;
+    int i;
 
     if (!open_socket())
         return;
@@ -209,19 +242,22 @@ static void send_state(unsigned int frame_index, const mm_state* s, uint32_t fla
     put_u32(packet + 40, (uint32_t) s->game_mode);
     put_u32(packet + 44, (uint32_t) s->file_num);
 
-    if (sendto(l_socket, (const char*) packet, sizeof(packet), 0,
-               (const struct sockaddr*) &l_destination, sizeof(l_destination)) < 0 &&
-        !l_send_error_logged)
+    for (i = 0; i < l_destination_count; i++)
     {
+        if (sendto(l_socket, (const char*) packet, sizeof(packet), 0,
+                   (const struct sockaddr*) &l_destinations[i], sizeof(l_destinations[i])) < 0 &&
+            !l_send_error_logged)
+        {
 #ifdef _WIN32
-        int error = WSAGetLastError();
-        if (error == WSAECONNRESET || error == WSAEWOULDBLOCK)
-            return;
+            int error = WSAGetLastError();
+            if (error == WSAECONNRESET || error == WSAEWOULDBLOCK)
+                continue;
 #else
-        int error = 0;
+            int error = 0;
 #endif
-        l_send_error_logged = 1;
-        DebugMessage(M64MSG_WARNING, "[MMLinkState] UDP send failed (error %d); further send errors are not logged", error);
+            l_send_error_logged = 1;
+            DebugMessage(M64MSG_WARNING, "[MMLinkState] UDP send failed (error %d); further send errors are not logged", error);
+        }
     }
 }
 
