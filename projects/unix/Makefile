@@ -609,11 +609,8 @@ SOURCE = \
 ifeq ($(MM_HEALTH_SAMPLER),1)
 CFLAGS += -DMM_HEALTH_SAMPLER
 SOURCE += $(SRCDIR)/main/mm_health_sampler.c
-ifeq ($(MM_LINKSTATE_UDP),1)
-CFLAGS += -DMM_LINKSTATE_UDP
 ifeq ($(OS), MINGW)
 LDLIBS += -lws2_32
-endif
 endif
 endif
 

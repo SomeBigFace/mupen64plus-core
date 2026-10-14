@@ -1,15 +1,12 @@
+/* Majora's Mask (US) state sampler: reads a few save-context fields once per
+ * emulator frame, logs health changes, and exports a LinkState v0 datagram
+ * to 127.0.0.1 over UDP. Read-only: it never writes emulated memory.
+ * Packet layout: mm-bridge/LINKSTATE.md. */
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define M64P_CORE_PROTOTYPES 1
-#include "api/callbacks.h"
-#include "api/m64p_debugger.h"
-#include "api/m64p_types.h"
-#include "main/mm_health_sampler.h"
-#include "main/rom.h"
-
-#ifdef MM_LINKSTATE_UDP
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -20,128 +17,64 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
-#endif
+
+#define M64P_CORE_PROTOTYPES 1
+#include "api/callbacks.h"
+#include "api/m64p_debugger.h"
+#include "api/m64p_types.h"
+#include "main/mm_health_sampler.h"
+#include "main/rom.h"
 
 #define MM_ROM_MD5 "2A0A8ACB61538235BC1094D297FB6556"
 
-/* gSaveContext base, derived from the verified health address minus the
- * SaveContext offset of saveInfo.playerData.health (0x24 + 0x12) in the
- * mm-decomp z64save.h. Only health is live-verified; the rest are
- * source-derived candidates until correlated in-game. */
+/* gSaveContext (mm-decomp z64save.h). The base is both derived from the
+ * verified health address and listed in Zelda64RecompSyms datasyms.toml. */
 #define MM_SAVE_CONTEXT UINT32_C(0x801EF670)
-#define MM_HEALTH_ADDRESS (MM_SAVE_CONTEXT + 0x36)          /* s16, verified */
-#define MM_EQUIPPED_MASK_ADDRESS (MM_SAVE_CONTEXT + 0x04)   /* u8 */
-#define MM_TIME_ADDRESS (MM_SAVE_CONTEXT + 0x0C)            /* u16 */
-#define MM_DAY_ADDRESS (MM_SAVE_CONTEXT + 0x18)             /* s32 */
-#define MM_PLAYER_FORM_ADDRESS (MM_SAVE_CONTEXT + 0x20)     /* u8 */
-#define MM_HEALTH_CAPACITY_ADDRESS (MM_SAVE_CONTEXT + 0x34) /* s16 */
-#define MM_MAGIC_LEVEL_ADDRESS (MM_SAVE_CONTEXT + 0x38)     /* s8 */
-#define MM_MAGIC_ADDRESS (MM_SAVE_CONTEXT + 0x39)           /* s8 */
-#define MM_RUPEES_ADDRESS (MM_SAVE_CONTEXT + 0x3A)          /* s16 */
+#define MM_HEALTH_ADDRESS (MM_SAVE_CONTEXT + 0x36)          /* s16 saveInfo.playerData.health, verified */
+#define MM_PLAYER_FORM_ADDRESS (MM_SAVE_CONTEXT + 0x20)     /* u8 save.playerForm */
+#define MM_HEALTH_CAPACITY_ADDRESS (MM_SAVE_CONTEXT + 0x34) /* s16 saveInfo.playerData.healthCapacity */
+#define MM_MAGIC_LEVEL_ADDRESS (MM_SAVE_CONTEXT + 0x38)     /* s8 saveInfo.playerData.magicLevel */
+#define MM_MAGIC_ADDRESS (MM_SAVE_CONTEXT + 0x39)           /* s8 saveInfo.playerData.magic */
+#define MM_FILE_NUM_ADDRESS (MM_SAVE_CONTEXT + 0x3CA0)      /* s32 fileNum, 0xFF = no file (z_title.c) */
+#define MM_GAME_MODE_ADDRESS (MM_SAVE_CONTEXT + 0x3CA8)     /* s32 gameMode, 0 = GAMEMODE_NORMAL */
 
-/* Live Player actor, resolved fresh every frame through
- * sCamPlayState -> PlayState.actorCtx.actorLists[ACTORCAT_PLAYER].first.
- * sCamPlayState's address is from Zelda64RecompSyms (US rev 1); the offsets
- * are from mm-decomp z64.h / z64actor.h / z64player.h. All candidates. */
-#define MM_CAM_PLAY_STATE_PTR UINT32_C(0x801EDC28)
-#define MM_PLAY_SCENE_ID 0xA4             /* s16 PlayState.sceneId */
-#define MM_PLAY_PLAYER_LIST_FIRST 0x1CCC  /* actorCtx 0x1CA0 + lists 0x10 + 2 * 0xC + first 0x4 */
-#define MM_ACTOR_ID 0x000                 /* s16, ACTOR_PLAYER = 0 */
-#define MM_ACTOR_CATEGORY 0x002           /* u8, ACTORCAT_PLAYER = 2 */
-#define MM_ACTOR_WORLD_POS 0x024          /* Vec3f */
-#define MM_ACTOR_WORLD_ROT 0x030          /* Vec3s */
-#define MM_ACTOR_VELOCITY 0x064           /* Vec3f */
-#define MM_ACTOR_SPEED 0x070              /* f32 */
-#define MM_ACTOR_SHAPE_YAW 0x0BE          /* s16 shape.rot.y, the facing */
-#define MM_PLAYER_TRANSFORMATION 0x14B    /* u8 PlayerTransformation */
-#define MM_PLAYER_CURRENT_MASK 0x153      /* u8 PlayerMask */
-#define MM_PLAYER_STATE_FLAGS1 0xA6C      /* u32 x3 */
-#define MM_PLAYER_LINEAR_VELOCITY 0xAD0   /* f32 */
+/* Frame signals (Zelda64RecompSyms datasyms.toml; candidates).
+ * sGraphPrevUpdateEndTime (graph.c) is the osGetTime() stamp written once at
+ * the end of every completed graph/game update; its low word changes exactly
+ * once per game frame. sIrqMgrRetraceCount (irqmgr.c) counts VI retraces. */
+#define MM_GRAPH_UPDATE_END_TIME_ADDRESS UINT32_C(0x801F8150) /* OSTime (u64) */
+#define MM_VI_RETRACE_COUNT_ADDRESS UINT32_C(0x80096B78)      /* s32 */
 
-typedef struct
-{
-    uint32_t actor;          /* 0 when no valid Player was found */
-    int16_t scene_id;
-    uint32_t pos[3];         /* raw f32 bits */
-    int16_t world_rot[3];
-    int16_t facing;
-    uint32_t velocity[3];    /* raw f32 bits */
-    uint32_t speed;          /* raw f32 bits */
-    uint32_t linear_velocity;
-    uint32_t state_flags[3];
-    uint8_t transformation;
-    uint8_t current_mask;
-} mm_player_state;
+#define MM_GAMEMODE_NORMAL 0
+#define MM_NO_FILE 0xFF
 
-static int is_rdram_pointer(uint32_t address)
-{
-    /* KSEG0 over 8 MiB of RDRAM, word aligned. */
-    return address >= UINT32_C(0x80000000) && address < UINT32_C(0x80800000) && (address & 3) == 0;
-}
+/* LinkState v0 wire format: 48 bytes, little-endian. */
+#define MM_LINKSTATE_VERSION 0
+#define MM_LINKSTATE_SIZE 48
+#define MM_LINKSTATE_DEFAULT_PORT 47647
 
-static void read_player_state(mm_player_state* p)
-{
-    uint32_t play = DebugMemRead32(MM_CAM_PLAY_STATE_PTR);
-    uint32_t actor;
-    int i;
+#define MM_FLAG_ROM_MATCH 0x1u
+#define MM_FLAG_GAMEPLAY_ACTIVE 0x2u
+#define MM_FLAG_NEW_GAME_FRAME 0x4u
 
-    memset(p, 0, sizeof(*p));
-    if (!is_rdram_pointer(play))
-        return;
-    actor = DebugMemRead32(play + MM_PLAY_PLAYER_LIST_FIRST);
-    if (!is_rdram_pointer(actor) || DebugMemRead16(actor + MM_ACTOR_ID) != 0 ||
-        DebugMemRead8(actor + MM_ACTOR_CATEGORY) != 2)
-        return;
-
-    p->actor = actor;
-    p->scene_id = (int16_t) DebugMemRead16(play + MM_PLAY_SCENE_ID);
-    for (i = 0; i < 3; i++)
-    {
-        p->pos[i] = DebugMemRead32(actor + MM_ACTOR_WORLD_POS + 4 * i);
-        p->world_rot[i] = (int16_t) DebugMemRead16(actor + MM_ACTOR_WORLD_ROT + 2 * i);
-        p->velocity[i] = DebugMemRead32(actor + MM_ACTOR_VELOCITY + 4 * i);
-        p->state_flags[i] = DebugMemRead32(actor + MM_PLAYER_STATE_FLAGS1 + 4 * i);
-    }
-    p->facing = (int16_t) DebugMemRead16(actor + MM_ACTOR_SHAPE_YAW);
-    p->speed = DebugMemRead32(actor + MM_ACTOR_SPEED);
-    p->linear_velocity = DebugMemRead32(actor + MM_PLAYER_LINEAR_VELOCITY);
-    p->transformation = DebugMemRead8(actor + MM_PLAYER_TRANSFORMATION);
-    p->current_mask = DebugMemRead8(actor + MM_PLAYER_CURRENT_MASK);
-}
+#define MM_FIELD_HEALTH 0x01u
+#define MM_FIELD_HEALTH_CAPACITY 0x02u
+#define MM_FIELD_MAGIC 0x04u
+#define MM_FIELD_MAGIC_LEVEL 0x08u
+#define MM_FIELD_SAVED_FORM 0x10u
 
 typedef struct
 {
+    uint32_t vi_count;
+    uint32_t game_update_stamp;
+    int32_t game_mode;
+    int32_t file_num;
     int16_t health;
     int16_t health_capacity;
-    int16_t rupees;
-    uint16_t time;
-    int32_t day;
-    int8_t magic_level;
     int8_t magic;
-    uint8_t player_form;
-    uint8_t equipped_mask;
-} mm_link_state;
-
-static void read_link_state(mm_link_state* s)
-{
-    s->health = (int16_t) DebugMemRead16(MM_HEALTH_ADDRESS);
-    s->health_capacity = (int16_t) DebugMemRead16(MM_HEALTH_CAPACITY_ADDRESS);
-    s->rupees = (int16_t) DebugMemRead16(MM_RUPEES_ADDRESS);
-    s->time = DebugMemRead16(MM_TIME_ADDRESS);
-    s->day = (int32_t) DebugMemRead32(MM_DAY_ADDRESS);
-    s->magic_level = (int8_t) DebugMemRead8(MM_MAGIC_LEVEL_ADDRESS);
-    s->magic = (int8_t) DebugMemRead8(MM_MAGIC_ADDRESS);
-    s->player_form = DebugMemRead8(MM_PLAYER_FORM_ADDRESS);
-    s->equipped_mask = DebugMemRead8(MM_EQUIPPED_MASK_ADDRESS);
-}
-
-#ifdef MM_LINKSTATE_UDP
-/* LinkState wire format v2: 96 bytes, little-endian, one datagram per
- * rendered frame to 127.0.0.1:MM_LINKSTATE_PORT (default 47647).
- * See mm-bridge/PROTOCOL.md. */
-#define MM_LINKSTATE_VERSION 2
-#define MM_LINKSTATE_SIZE 96
-#define MM_LINKSTATE_DEFAULT_PORT 47647
+    int8_t magic_level;
+    uint8_t saved_form;
+} mm_state;
 
 #ifdef _WIN32
 typedef SOCKET mm_socket;
@@ -153,8 +86,30 @@ typedef int mm_socket;
 
 static mm_socket l_socket = MM_BAD_SOCKET;
 static int l_socket_failed;
+static int l_send_error_logged;
 static struct sockaddr_in l_destination;
 static uint32_t l_sequence;
+
+static void read_state(mm_state* s)
+{
+    /* Low word of the big-endian u64 OSTime: the fast-changing half. */
+    s->game_update_stamp = DebugMemRead32(MM_GRAPH_UPDATE_END_TIME_ADDRESS + 4);
+    s->vi_count = DebugMemRead32(MM_VI_RETRACE_COUNT_ADDRESS);
+    s->game_mode = (int32_t) DebugMemRead32(MM_GAME_MODE_ADDRESS);
+    s->file_num = (int32_t) DebugMemRead32(MM_FILE_NUM_ADDRESS);
+    s->health = (int16_t) DebugMemRead16(MM_HEALTH_ADDRESS);
+    s->health_capacity = (int16_t) DebugMemRead16(MM_HEALTH_CAPACITY_ADDRESS);
+    s->magic = (int8_t) DebugMemRead8(MM_MAGIC_ADDRESS);
+    s->magic_level = (int8_t) DebugMemRead8(MM_MAGIC_LEVEL_ADDRESS);
+    s->saved_form = DebugMemRead8(MM_PLAYER_FORM_ADDRESS);
+}
+
+/* A save file is loaded and the game is in ordinary play (not the title
+ * demo, file select, credits or owl-save screen). Health 0 stays valid. */
+static int gameplay_active(const mm_state* s)
+{
+    return s->game_mode == MM_GAMEMODE_NORMAL && s->file_num != MM_NO_FILE;
+}
 
 static void put_u16(uint8_t* p, uint16_t v)
 {
@@ -168,8 +123,8 @@ static void put_u32(uint8_t* p, uint32_t v)
     put_u16(p + 2, (uint16_t) (v >> 16));
 }
 
-/* Opens a non-blocking socket once; on failure, logs once and stops trying
- * so the emulation thread never stalls on networking. */
+/* Opens a non-blocking socket on first use. On failure it logs once and
+ * stops trying, so the emulation thread never stalls on networking. */
 static int open_socket(void)
 {
     const char* port_text;
@@ -191,20 +146,27 @@ static int open_socket(void)
         if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0)
         {
             l_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-            if (l_socket != MM_BAD_SOCKET)
-                ioctlsocket(l_socket, FIONBIO, &non_blocking);
+            if (l_socket != MM_BAD_SOCKET && ioctlsocket(l_socket, FIONBIO, &non_blocking) != 0)
+            {
+                closesocket(l_socket);
+                l_socket = MM_BAD_SOCKET;
+            }
         }
     }
 #else
     l_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (l_socket != MM_BAD_SOCKET)
-        fcntl(l_socket, F_SETFL, fcntl(l_socket, F_GETFL, 0) | O_NONBLOCK);
+    if (l_socket != MM_BAD_SOCKET &&
+        fcntl(l_socket, F_SETFL, fcntl(l_socket, F_GETFL, 0) | O_NONBLOCK) != 0)
+    {
+        close(l_socket);
+        l_socket = MM_BAD_SOCKET;
+    }
 #endif
 
     if (l_socket == MM_BAD_SOCKET)
     {
         l_socket_failed = 1;
-        DebugMessage(M64MSG_WARNING, "[MMLinkState] UDP socket unavailable; LinkState export disabled");
+        DebugMessage(M64MSG_WARNING, "[MMLinkState] UDP socket setup failed; LinkState export disabled");
         return 0;
     }
 
@@ -217,12 +179,14 @@ static int open_socket(void)
     return 1;
 }
 
-/* Fire and forget: a dropped datagram or an absent listener is not an error. */
-static void send_link_state(unsigned int frame_index, const mm_link_state* s,
-                            const mm_player_state* p)
+/* Fire and forget. With nobody listening, Windows may report a connection
+ * reset on a later send; that and a full buffer are expected and ignored,
+ * and any other error is logged once. */
+static void send_state(unsigned int frame_index, const mm_state* s, uint32_t flags)
 {
     uint8_t packet[MM_LINKSTATE_SIZE];
-    int i;
+    uint32_t fields = MM_FIELD_HEALTH | MM_FIELD_HEALTH_CAPACITY | MM_FIELD_MAGIC |
+                      MM_FIELD_MAGIC_LEVEL | MM_FIELD_SAVED_FORM;
 
     if (!open_socket())
         return;
@@ -233,82 +197,75 @@ static void send_link_state(unsigned int frame_index, const mm_link_state* s,
     put_u16(packet + 6, MM_LINKSTATE_SIZE);
     put_u32(packet + 8, l_sequence++);
     put_u32(packet + 12, frame_index);
-    /* flags: bit 0 = ROM MD5 matched, bit 1 = Player actor valid */
-    put_u32(packet + 16, 1u | (p->actor != 0 ? 2u : 0u));
-    put_u16(packet + 20, (uint16_t) s->health);
-    put_u16(packet + 22, (uint16_t) s->health_capacity);
-    put_u16(packet + 24, (uint16_t) s->rupees);
-    put_u16(packet + 26, s->time);
-    put_u32(packet + 28, (uint32_t) s->day);
-    packet[32] = (uint8_t) s->magic_level;
-    packet[33] = (uint8_t) s->magic;
-    packet[34] = s->player_form;
-    packet[35] = s->equipped_mask;
-    put_u32(packet + 36, p->actor);
-    for (i = 0; i < 3; i++)
-    {
-        put_u32(packet + 40 + 4 * i, p->pos[i]);
-        put_u16(packet + 52 + 2 * i, (uint16_t) p->world_rot[i]);
-        put_u32(packet + 60 + 4 * i, p->velocity[i]);
-        put_u32(packet + 80 + 4 * i, p->state_flags[i]);
-    }
-    put_u16(packet + 58, (uint16_t) p->facing);
-    put_u32(packet + 72, p->speed);
-    put_u32(packet + 76, p->linear_velocity);
-    packet[92] = p->transformation;
-    packet[93] = p->current_mask;
-    put_u16(packet + 94, (uint16_t) p->scene_id);
+    put_u32(packet + 16, s->vi_count);
+    put_u32(packet + 20, s->game_update_stamp);
+    put_u32(packet + 24, flags);
+    put_u32(packet + 28, fields);
+    put_u16(packet + 32, (uint16_t) s->health);
+    put_u16(packet + 34, (uint16_t) s->health_capacity);
+    packet[36] = (uint8_t) s->magic;
+    packet[37] = (uint8_t) s->magic_level;
+    packet[38] = s->saved_form;
+    put_u32(packet + 40, (uint32_t) s->game_mode);
+    put_u32(packet + 44, (uint32_t) s->file_num);
 
-    sendto(l_socket, (const char*) packet, sizeof(packet), 0,
-           (const struct sockaddr*) &l_destination, sizeof(l_destination));
-}
+    if (sendto(l_socket, (const char*) packet, sizeof(packet), 0,
+               (const struct sockaddr*) &l_destination, sizeof(l_destination)) < 0 &&
+        !l_send_error_logged)
+    {
+#ifdef _WIN32
+        int error = WSAGetLastError();
+        if (error == WSAECONNRESET || error == WSAEWOULDBLOCK)
+            return;
+#else
+        int error = 0;
 #endif
+        l_send_error_logged = 1;
+        DebugMessage(M64MSG_WARNING, "[MMLinkState] UDP send failed (error %d); further send errors are not logged", error);
+    }
+}
 
 void mm_health_sampler_sample(unsigned int frame_index)
 {
-    static mm_link_state previous;
-    static int has_previous_sample;
-    static uint8_t previous_transformation = 0xFF;
-    mm_link_state current;
-    mm_player_state player;
+    static int16_t previous_health;
+    static int has_previous_health;
+    static uint32_t previous_stamp;
+    static int has_previous_stamp;
+    static int previous_active = -1;
+    mm_state current;
+    uint32_t flags = MM_FLAG_ROM_MATCH;
+    int active;
 
     if (strcmp(ROM_SETTINGS.MD5, MM_ROM_MD5) != 0)
         return;
 
-    read_link_state(&current);
-    read_player_state(&player);
+    read_state(&current);
+    active = gameplay_active(&current);
+    if (active)
+        flags |= MM_FLAG_GAMEPLAY_ACTIVE;
+    if (!has_previous_stamp || current.game_update_stamp != previous_stamp)
+        flags |= MM_FLAG_NEW_GAME_FRAME;
+    previous_stamp = current.game_update_stamp;
+    has_previous_stamp = 1;
 
-#ifdef MM_LINKSTATE_UDP
-    send_link_state(frame_index, &current, &player);
-#endif
+    send_state(frame_index, &current, flags);
 
-    if (player.actor != 0 && player.transformation != previous_transformation)
+    if (active != previous_active)
     {
-        DebugMessage(M64MSG_INFO,
-                     "[MMHealthSampler] frame=%u player_actor=0x%08X transformation=%u current_mask=%u scene=%d (unverified fields)",
-                     frame_index, player.actor, (unsigned) player.transformation,
-                     (unsigned) player.current_mask, (int) player.scene_id);
-        previous_transformation = player.transformation;
+        DebugMessage(M64MSG_INFO, "[MMHealthSampler] frame=%u gameplay_active=%d game_mode=%d file_num=%d",
+                     frame_index, active, (int) current.game_mode, (int) current.file_num);
+        previous_active = active;
+        has_previous_health = 0;
     }
 
-    /* Change log, as before: wait for a loaded save (positive health). */
-    if (current.health <= 0)
-        return;
-
-    if (!has_previous_sample || current.health != previous.health)
+    /* Health is logged only during gameplay, where 0 is a real value (death). */
+    if (active && (!has_previous_health || current.health != previous_health))
     {
         DebugMessage(M64MSG_INFO,
                      "[MMHealthSampler] frame=%u address=0x%08X health_s16=%d hearts=%.2f",
                      frame_index, MM_HEALTH_ADDRESS, (int) current.health,
                      (double) current.health / 16.0);
+        previous_health = current.health;
+        has_previous_health = 1;
     }
-    if (!has_previous_sample || current.player_form != previous.player_form ||
-        current.equipped_mask != previous.equipped_mask)
-    {
-        DebugMessage(M64MSG_INFO,
-                     "[MMHealthSampler] frame=%u player_form=%u equipped_mask=0x%02X (unverified fields)",
-                     frame_index, (unsigned) current.player_form, (unsigned) current.equipped_mask);
-    }
-    previous = current;
-    has_previous_sample = 1;
 }
