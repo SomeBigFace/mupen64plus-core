@@ -79,6 +79,10 @@
 #include "util.h"
 #include "netplay.h"
 
+#ifdef MM_HEALTH_SAMPLER
+#include "mm_health_sampler.h"
+#endif
+
 #ifdef DBG
 #include "debugger/dbg_debugger.h"
 #endif
@@ -950,6 +954,10 @@ void new_frame(void)
 {
     if (g_FrameCallback != NULL)
         (*g_FrameCallback)(l_CurrentFrame);
+
+#ifdef MM_HEALTH_SAMPLER
+    mm_health_sampler_sample(l_CurrentFrame);
+#endif
 
     /* advance the current frame */
     l_CurrentFrame++;
