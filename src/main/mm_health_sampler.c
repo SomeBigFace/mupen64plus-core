@@ -1,5 +1,5 @@
 /* Majora's Mask (US) state sampler: reads a few save-context fields once per
- * emulator frame, logs health changes, and exports a LinkState v0 datagram
+ * emulator frame, logs health changes, and exports a LinkState datagram (v1: v0 fields plus the live Player)
  * to 127.0.0.1 over UDP. Read-only: it never writes emulated memory.
  * Packet layout: mm-bridge/LINKSTATE.md. */
 
@@ -48,20 +48,69 @@
 #define MM_GAMEMODE_NORMAL 0
 #define MM_NO_FILE 0xFF
 
-/* LinkState v0 wire format: 48 bytes, little-endian. */
-#define MM_LINKSTATE_VERSION 0
-#define MM_LINKSTATE_SIZE 48
+/* The live Player actor, resolved fresh every frame (never cached):
+ * sCamPlayState (Zelda64RecompSyms) -> PlayState.actorCtx.actorLists[ACTORCAT_PLAYER].
+ * Offsets are from mm-decomp z64.h, z64actor.h, z64player.h and
+ * z64animation.h at 5607eec18. All fields are candidates. */
+#define MM_CAM_PLAY_STATE_PTR UINT32_C(0x801EDC28) /* PlayState* sCamPlayState (z_camera.c) */
+#define MM_PLAY_SCENE_ID 0x000A4                   /* s16 PlayState.sceneId */
+#define MM_PLAY_PLAYER_LIST_LENGTH 0x01CC8         /* s32 actorCtx(0x1CA0).actorLists[2].length */
+#define MM_PLAY_PLAYER_LIST_FIRST 0x01CCC          /* Actor* actorCtx.actorLists[2].first */
+#define MM_PLAY_GAMEPLAY_FRAMES 0x18840            /* u32 PlayState.gameplayFrames */
+#define MM_SCENE_MAX 0x71                          /* z64scene.h SCENE_MAX */
+#define MM_ACTOR_ID 0x000                          /* s16, ACTOR_PLAYER = 0 */
+#define MM_ACTOR_CATEGORY 0x002                    /* u8, ACTORCAT_PLAYER = 2 */
+#define MM_ACTOR_WORLD_POS 0x024                   /* Vec3f world.pos */
+#define MM_ACTOR_WORLD_ROT 0x030                   /* Vec3s world.rot */
+#define MM_ACTOR_VELOCITY 0x064                    /* Vec3f velocity */
+#define MM_ACTOR_SPEED 0x070                       /* f32 speed */
+#define MM_ACTOR_SHAPE_YAW 0x0BE                   /* s16 shape.rot.y: facing */
+#define MM_PLAYER_HELD_ITEM 0x148                  /* u8 heldItemId (ItemId) */
+#define MM_PLAYER_TRANSFORMATION 0x14B             /* u8 transformation */
+#define MM_PLAYER_CURRENT_MASK 0x153               /* u8 currentMask (PlayerMask) */
+#define MM_PLAYER_ANIMATION 0x248                  /* void* skelAnime(0x240).animation(0x08) */
+#define MM_PLAYER_ANIM_FRAME 0x258                 /* f32 skelAnime.curFrame(0x18) */
+#define MM_PLAYER_STATE_FLAGS1 0xA6C               /* u32 stateFlags1..3 */
+#define MM_PLAYER_LINEAR_VELOCITY 0xAD0            /* f32 linearVelocity */
+#define MM_PLAYER_CURRENT_YAW 0xAD4                /* s16 currentYaw: movement direction */
+
+/* LinkState v1 wire format: 128 bytes, little-endian. Append-only: bytes
+ * 0-47 are exactly v0's, the Player block follows (mm-bridge/LINKSTATE.md). */
+#define MM_LINKSTATE_VERSION 1
+#define MM_LINKSTATE_SIZE 128
 #define MM_LINKSTATE_DEFAULT_PORT 47647
 
 #define MM_FLAG_ROM_MATCH 0x1u
 #define MM_FLAG_GAMEPLAY_ACTIVE 0x2u
 #define MM_FLAG_NEW_GAME_FRAME 0x4u
+#define MM_FLAG_PLAYER_VALID 0x8u
 
 #define MM_FIELD_HEALTH 0x01u
 #define MM_FIELD_HEALTH_CAPACITY 0x02u
 #define MM_FIELD_MAGIC 0x04u
 #define MM_FIELD_MAGIC_LEVEL 0x08u
 #define MM_FIELD_SAVED_FORM 0x10u
+#define MM_FIELD_PLAYER_BLOCK 0x20u
+
+typedef struct
+{
+    uint32_t actor; /* 0 when no valid Player */
+    uint32_t gameplay_frames;
+    int16_t scene_id;
+    int16_t facing;
+    uint32_t pos[3]; /* raw f32 bits, as are the other f32 fields */
+    int16_t world_rot[3];
+    int16_t current_yaw;
+    uint32_t velocity[3];
+    uint32_t speed;
+    uint32_t linear_velocity;
+    uint32_t state_flags[3];
+    uint32_t animation;
+    uint32_t anim_frame;
+    uint8_t transformation;
+    uint8_t current_mask;
+    uint8_t held_item;
+} mm_player;
 
 typedef struct
 {
@@ -112,6 +161,58 @@ static void read_state(mm_state* s)
 static int gameplay_active(const mm_state* s)
 {
     return s->game_mode == MM_GAMEMODE_NORMAL && s->file_num != MM_NO_FILE;
+}
+
+static int is_rdram_pointer(uint32_t address)
+{
+    /* KSEG0 over the 8 MiB of RDRAM MM requires, word aligned. */
+    return address >= UINT32_C(0x80000000) && address < UINT32_C(0x80800000) && (address & 3) == 0;
+}
+
+/* Fills *p with the live Player, or leaves p->actor = 0 when any check
+ * fails. Gameplay must be active first: across scene transitions
+ * sCamPlayState can still point at a torn-down PlayState. */
+static void read_player(const mm_state* s, mm_player* p)
+{
+    uint32_t play, actor;
+    int32_t list_length;
+    int16_t scene_id;
+    int i;
+
+    memset(p, 0, sizeof(*p));
+    if (!gameplay_active(s))
+        return;
+    play = DebugMemRead32(MM_CAM_PLAY_STATE_PTR);
+    if (!is_rdram_pointer(play))
+        return;
+    scene_id = (int16_t) DebugMemRead16(play + MM_PLAY_SCENE_ID);
+    list_length = (int32_t) DebugMemRead32(play + MM_PLAY_PLAYER_LIST_LENGTH);
+    if (scene_id < 0 || scene_id >= MM_SCENE_MAX || list_length < 1)
+        return;
+    actor = DebugMemRead32(play + MM_PLAY_PLAYER_LIST_FIRST);
+    if (!is_rdram_pointer(actor) || DebugMemRead16(actor + MM_ACTOR_ID) != 0 ||
+        DebugMemRead8(actor + MM_ACTOR_CATEGORY) != 2)
+        return;
+
+    p->actor = actor;
+    p->gameplay_frames = DebugMemRead32(play + MM_PLAY_GAMEPLAY_FRAMES);
+    p->scene_id = scene_id;
+    p->facing = (int16_t) DebugMemRead16(actor + MM_ACTOR_SHAPE_YAW);
+    for (i = 0; i < 3; i++)
+    {
+        p->pos[i] = DebugMemRead32(actor + MM_ACTOR_WORLD_POS + 4 * i);
+        p->world_rot[i] = (int16_t) DebugMemRead16(actor + MM_ACTOR_WORLD_ROT + 2 * i);
+        p->velocity[i] = DebugMemRead32(actor + MM_ACTOR_VELOCITY + 4 * i);
+        p->state_flags[i] = DebugMemRead32(actor + MM_PLAYER_STATE_FLAGS1 + 4 * i);
+    }
+    p->current_yaw = (int16_t) DebugMemRead16(actor + MM_PLAYER_CURRENT_YAW);
+    p->speed = DebugMemRead32(actor + MM_ACTOR_SPEED);
+    p->linear_velocity = DebugMemRead32(actor + MM_PLAYER_LINEAR_VELOCITY);
+    p->animation = DebugMemRead32(actor + MM_PLAYER_ANIMATION);
+    p->anim_frame = DebugMemRead32(actor + MM_PLAYER_ANIM_FRAME);
+    p->transformation = DebugMemRead8(actor + MM_PLAYER_TRANSFORMATION);
+    p->current_mask = DebugMemRead8(actor + MM_PLAYER_CURRENT_MASK);
+    p->held_item = DebugMemRead8(actor + MM_PLAYER_HELD_ITEM);
 }
 
 static void put_u16(uint8_t* p, uint16_t v)
@@ -214,11 +315,12 @@ static int open_socket(void)
 /* Fire and forget. With nobody listening, Windows may report a connection
  * reset on a later send; that and a full buffer are expected and ignored,
  * and any other error is logged once. */
-static void send_state(unsigned int frame_index, const mm_state* s, uint32_t flags)
+static void send_state(unsigned int frame_index, const mm_state* s, const mm_player* p,
+                       uint32_t flags)
 {
     uint8_t packet[MM_LINKSTATE_SIZE];
     uint32_t fields = MM_FIELD_HEALTH | MM_FIELD_HEALTH_CAPACITY | MM_FIELD_MAGIC |
-                      MM_FIELD_MAGIC_LEVEL | MM_FIELD_SAVED_FORM;
+                      MM_FIELD_MAGIC_LEVEL | MM_FIELD_SAVED_FORM | MM_FIELD_PLAYER_BLOCK;
     int i;
 
     if (!open_socket())
@@ -241,6 +343,27 @@ static void send_state(unsigned int frame_index, const mm_state* s, uint32_t fla
     packet[38] = s->saved_form;
     put_u32(packet + 40, (uint32_t) s->game_mode);
     put_u32(packet + 44, (uint32_t) s->file_num);
+
+    /* v1 Player block; all zero when flags lacks MM_FLAG_PLAYER_VALID. */
+    put_u32(packet + 48, p->actor);
+    put_u32(packet + 52, p->gameplay_frames);
+    put_u16(packet + 56, (uint16_t) p->scene_id);
+    put_u16(packet + 58, (uint16_t) p->facing);
+    for (i = 0; i < 3; i++)
+    {
+        put_u32(packet + 60 + 4 * i, p->pos[i]);
+        put_u16(packet + 72 + 2 * i, (uint16_t) p->world_rot[i]);
+        put_u32(packet + 80 + 4 * i, p->velocity[i]);
+        put_u32(packet + 100 + 4 * i, p->state_flags[i]);
+    }
+    put_u16(packet + 78, (uint16_t) p->current_yaw);
+    put_u32(packet + 92, p->speed);
+    put_u32(packet + 96, p->linear_velocity);
+    put_u32(packet + 112, p->animation);
+    put_u32(packet + 116, p->anim_frame);
+    packet[120] = p->transformation;
+    packet[121] = p->current_mask;
+    packet[122] = p->held_item;
 
     for (i = 0; i < l_destination_count; i++)
     {
@@ -268,7 +391,9 @@ void mm_health_sampler_sample(unsigned int frame_index)
     static uint32_t previous_stamp;
     static int has_previous_stamp;
     static int previous_active = -1;
+    static uint32_t previous_actor = 1; /* never a real value, so the first state logs */
     mm_state current;
+    mm_player player;
     uint32_t flags = MM_FLAG_ROM_MATCH;
     int active;
 
@@ -276,15 +401,25 @@ void mm_health_sampler_sample(unsigned int frame_index)
         return;
 
     read_state(&current);
+    read_player(&current, &player);
     active = gameplay_active(&current);
     if (active)
         flags |= MM_FLAG_GAMEPLAY_ACTIVE;
     if (!has_previous_stamp || current.game_update_stamp != previous_stamp)
         flags |= MM_FLAG_NEW_GAME_FRAME;
+    if (player.actor != 0)
+        flags |= MM_FLAG_PLAYER_VALID;
     previous_stamp = current.game_update_stamp;
     has_previous_stamp = 1;
 
-    send_state(frame_index, &current, flags);
+    send_state(frame_index, &current, &player, flags);
+
+    if (player.actor != previous_actor)
+    {
+        DebugMessage(M64MSG_INFO, "[MMHealthSampler] frame=%u player_actor=0x%08X scene=%d",
+                     frame_index, player.actor, (int) player.scene_id);
+        previous_actor = player.actor;
+    }
 
     if (active != previous_active)
     {
